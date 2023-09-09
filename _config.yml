@@ -26,7 +26,7 @@ description: >- # used by seo meta and the atom feed
   Mike(张明凯)的程序人生, 介绍关于Go和Rust的一些编程知识和学习历程,分享关于系统设计和架构方面的理解感悟
 
 # fill in the protocol & hostname for your site, e.g., 'https://username.github.io'
-url: "https://zhangmingkai4315.github.io"
+url: "https://zhangmingkai.cn"
 
 github:
   username: zhangmingkai4315 # change to your github username
