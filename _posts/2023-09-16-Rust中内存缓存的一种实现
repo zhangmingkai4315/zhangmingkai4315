@@ -1,0 +1,132 @@
+---
+author: 01
+title: Rust内存缓存的一种实现形式
+date: 2023-09-16 10:20:11 +0800
+categories: [Rust编程, 数据结构]
+tags: [rust]     # TAG names should always be lowercase
+---
+
+在应用程序的开发中，为了提升系统运行的性能，经常会用到缓存来存储最近使用的数据，降低获取数据的成本。比如对于数据库的数据查询，我们可以使用缓存的形式存储查询的结果，如果需要再次查询的时候，只需要检查下缓存是否已经包含该结果。如果存在的话，就不再需要进行数据库的查询，直接返回对应数据。
+
+当然实际的应用中除了使用内存缓存的形式，我们还可以使用Redis这种中心化的缓存。这种形式的好处是分布式系统中缓存的共享，降低维护数据的成本，只需要使用对应的接口就可以，无需自己实现。
+
+本文中我们并没有使用Redis, 而是自己实现一个内存缓存模块，该模块可以嵌入到任何需要缓存数据的地方使用，同时也学习一下如果使用Rust的相关特性来实现一个简单的内存缓存的功能。
+
+
+
+我们定义一个缓存的结构体，一般来说我们缓存的数据是按照KV的形式来存储，Key一般使用String的形式，Value使用二进制的形式存储，这样就可以支持任意的存储结构（只需要对应结构可以转换为二进制的形式），这里可以考虑使用**HashMap<String, Vec<<u8>>>**来定义缓存对象，但是这种方式最大的问题是本身存储数据是不考虑缓存命中效率的，一般来说我们的缓存中更希望能够存储热点数据，这里的话我们可以考虑使用LRU的方式来存储数据，
+
+我们可以使用Rust的LRU库来引入该数据结构，该结构的引入方式如下： 
+
+```
+[dependencies]
+lru = "0.11.1"
+```
+
+其实这种LRU的数据存储结构在Rust的早期版本标准库中是直接支持的，但是由于设计上可能觉得需要做一些精简， 降低标准库的规模，就把相关复杂一些的结构下放到第三方库中实现了。
+
+
+
+LRU缓存的使用方式如下： 
+
+```Rust
+  let mut cache = LruCache::new(NonZeroUsize::new(2).unwrap());
+  cache.put("apple", 3);
+  cache.put("banana", 2);
+  
+  assert_eq!(*cache.get(&"apple").unwrap(), 3);
+  assert_eq!(*cache.get(&"banana").unwrap(), 2);
+  assert!(cache.get(&"pear").is_none());
+
+```
+
+这里我们可以看到初始化的函数中有个NonZeroUsize的参数用于表示其容量规模，这种参数类型保证了我们传递的数据是一个非零的正整数(返回值为一个Option类型，需要做类型的检查)
+
+
+
+这里我们实现了一个程序 ，该程序内部有一个Database的访问对象， 还有个Cache的访问对象，我们实现的方式是
+
+- 对于任何数据库的查询都先经过缓存，确认不存在后再查询数据库，同时更新缓存数据。 
+- 更新数据库的时候如果更新成功，我们会把缓存中的数据清除，下次如果查询的时候会先去数据库中查询。
+
+
+
+我们先来定义数据库部分的接口Trait，这个Connector作为Trait可以被任何数据库连接对象实现，比如MySQL, 或者SQLite 甚至是一些MongoDB这种分布式内存数据库等等。 
+
+```rust
+trait Connector {
+    fn put(&mut self, key: &str, value: Vec<u8>) -> bool;
+    fn get(&self, key: &str) -> Option<&Vec<u8>>;
+}
+
+
+struct Application{
+    database: Box<dyn Connector>,
+    cached_query_num: usize,
+    total_query_num: usize,
+    cache: RefCell<lru::LruCache<String, Rc<Vec<u8>>>>
+}
+
+
+```
+
+
+
+这里Cache对象，作为内存缓存对象，本身我们使用了LRU的存储结构，可以再定义好容量后，无需管理内部数据的分配和释放，降低了维护成本，同时作为对于热点数据敏感的数据结构，删除数据时优先保留那些经常使用到的数据，提升命中率。
+
+存储的结构KV中Value变成了一个RC结构（并发不安全），之所以这样是因为我们的LRU本身会删除对象，如果直接返回一个&T类型，那一旦删除后对象本身变成了不可用，同时我们又不希望内存多处Copy，因此通过引用计数的方式来管理更效率。 
+
+另外需要注意的这里外层还封装了一层RefCell（并发不安全），这里提供的是一种内部可变性，允许我们在对象Application本身是引用类型的时候也可以修改改数据，如下面的get方法。
+
+
+
+```rust
+impl Application {
+    fn new ()->Self{
+        Application{
+            database: Box::new( DBConnector::new(1000)),
+            total_query_num: 0,
+            cached_query_num: 0,
+            cache: RefCell::new(lru::LruCache::new(NonZeroUsize::new(10).unwrap()))
+        }
+    }
+
+    fn insert(&mut self, key: &str, value: Vec<u8>) -> bool {
+        let status = self.database.put(key, value);
+        if status == true{
+            self.cache.borrow_mut().pop(key);
+            return status;
+        }
+        return false;
+    }
+
+    fn get(&self, name: &str) -> Option<Rc<Vec<u8>>>{
+        {
+            let mut cache = self.cache.borrow_mut();
+            if let Some(cache_data) = cache.get(name) {
+                return Some(cache_data.clone());
+            }
+        }
+
+        if let Some(val ) = self.database.get(name){
+            // may be time cost work in some minutes
+            let mut temp = val.clone();
+            temp.sort();
+            let cache_data = Rc::new(temp);
+            {
+                let mut cache = self.cache.borrow_mut();
+                cache.put(String::from(name), cache_data.clone());
+            }
+
+            return Some(cache_data);
+        }
+        return None
+    }
+}
+
+```
+
+
+
+这样我们就实现了一个简单的内存缓存功能， 同时我们也可以通过计数器的形式增加一些数据Metrics， 来查看缓存的实际命中情况，逐步优化我们的缓存功能。
+
